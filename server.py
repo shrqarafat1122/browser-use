@@ -59,30 +59,20 @@ async def run_task(
             browser=Browser(use_cloud=True),
         )
 
-        history = await agent.run()
-        logger.info("Agent done: %s", history.is_done())
-        logger.info("Agent result: %r", history.final_result())
-        logger.info("Agent history: %r", history)
-        final = history.final_result()
         
+history = await agent.run()
 
-        if final is None:
-            logger.warning("Agent completed without a final result")
-            return {
-                "status": "no_result",
-                "message": "Agent returned no final result",
-                "is_done": history.is_done()
-            }
+logger.info("Agent is_done: %s", history.is_done())
+logger.info("Agent final_result: %r", history.final_result())
 
-        return {
-            "status": "success",
-            "result": final,
-            "is_done": history.is_done()
-        }
+try:
+    actions = history.action_names()
+    logger.info("Agent actions: %r", actions)
+except Exception:
+    logger.exception("Could not read agent actions")
 
-    except Exception:
-        logger.exception("Browser task failed")
-        raise HTTPException(
-            status_code=500,
-            detail="Browser task failed; check server logs"
-        )
+return {
+    "status": "debug",
+    "is_done": history.is_done(),
+    "result": history.final_result(),
+}
