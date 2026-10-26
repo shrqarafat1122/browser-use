@@ -60,7 +60,11 @@ async def run_task(
         )
 
         history = await agent.run()
+        logger.info("Agent done: %s", history.is_done())
+        logger.info("Agent result: %r", history.final_result())
+        logger.info("Agent history: %r", history)
         final = history.final_result()
+        
 
         if final is None:
             logger.warning("Agent completed without a final result")
