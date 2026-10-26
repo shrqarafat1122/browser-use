@@ -55,24 +55,40 @@ async def run_task(
     try:
         agent = Agent(
             task=body.task,
-            llm=ChatOpenAI(model="gpt-4.1-mini"),
+            llm=ChatOpenAI(
+                model=os.getenv(
+                    "OMNIROUTE_MODEL",
+                    "agy/claude-opus-4-6"
+                ),
+                base_url=os.getenv(
+                    "OMNIROUTE_BASE_URL",
+                    "https://shariqbabu-omniroute.hf.space/v1"
+                ),
+                api_key=os.getenv("OPENAI_API_KEY"),
+            ),
             browser=Browser(use_cloud=True),
         )
 
-        
-history = await agent.run()
+        history = await agent.run()
 
-logger.info("Agent is_done: %s", history.is_done())
-logger.info("Agent final_result: %r", history.final_result())
+        logger.info("Agent is_done: %s", history.is_done())
+        logger.info("Agent final_result: %r", history.final_result())
 
-try:
-    actions = history.action_names()
-    logger.info("Agent actions: %r", actions)
-except Exception:
-    logger.exception("Could not read agent actions")
+        try:
+            actions = history.action_names()
+            logger.info("Agent actions: %r", actions)
+        except Exception:
+            logger.exception("Could not read agent actions")
 
-return {
-    "status": "debug",
-    "is_done": history.is_done(),
-    "result": history.final_result(),
-}
+        return {
+            "status": "success",
+            "is_done": history.is_done(),
+            "result": history.final_result(),
+        }
+
+    except Exception as exc:
+        logger.exception("Agent execution failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Agent execution failed. Check server logs."
+        ) from exc
