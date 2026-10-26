@@ -3,7 +3,7 @@ import os
 import hmac
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-from browser_use import Agent, ChatOpenAI
+from browser_use import Agent, Browser, ChatOpenAI
 
 app = FastAPI(title="Browser Use API")
 
@@ -35,8 +35,9 @@ async def run_task(
         raise HTTPException(status_code=500, detail="OpenAI API key missing")
 
     agent = Agent(
-        task=body.task,
-        llm=ChatOpenAI(model="gpt-4.1-mini"),
-    )
+    task=body.task,
+    llm=ChatOpenAI(model="gpt-4.1-mini"),
+    browser=Browser(use_cloud=True),
+  )
     result = await agent.run()
     return {"result": result.final_result()}
