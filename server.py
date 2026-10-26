@@ -36,7 +36,7 @@ async def run_task(
 
     agent = Agent(
     task=body.task,
-    llm=ChatOpenAI(model="gpt-4.1-mini"),
+    llm=ChatOpenAI(model="gemini-3.6-flash"),
     browser=Browser(use_cloud=True),
   )
     result = await agent.run()
