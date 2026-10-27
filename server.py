@@ -2,11 +2,13 @@ import os
 import hmac
 import logging
 import re
+import glob
+import shutil
 import asyncio
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, Header, HTTPException
-from browser_use import Agent, BrowserProfile, BrowserSession, ChatOpenAI, Controller
+from browser_use import Agent, BrowserProfile, BrowserSession, ChatOpenAI, Controller, ActionResult
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,96 +17,174 @@ logging.basicConfig(
 logger = logging.getLogger("browser_use_api")
 
 app = FastAPI(
-    title="Browser Use Universal API & Stream Sniffer",
-    description="Automated AI browser agent with real-time network log stream sniffer",
-    version="3.3.0"
+    title="Browser Use Universal API & Stream Sniffer (Local Stealth Edition)",
+    description="100% Free local headless browser runner with Cloudflare Turnstile stealth and ad blocking",
+    version="4.1.0"
 )
 
 controller = Controller()
 
-JS_EXTRACTOR = """() => {
-    const list = [];
-    try {
-        // 1. Video, Source, and Iframe tags
-        document.querySelectorAll('video, source, iframe').forEach(el => {
-            if (el.src) list.push(el.src);
-        });
+# Anti-detection + Anti-ad + Replit Linux container flags
+STEALTH_ARGS = [
+    "--headless=new",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--disable-blink-features=AutomationControlled",
+    "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "--disable-popup-blocking=false",
+    "--blink-settings=blockedPopup=true",
+    "--disable-notifications",
+    "--disable-extensions",
+    "--host-rules=MAP breachbillboardpredestination.com 127.0.0.1, MAP *.predestination.com 127.0.0.1, MAP *.highperformancegate.com 127.0.0.1, MAP *.histats.com 127.0.0.1, MAP *.onclickmax.com 127.0.0.1"
+]
 
-        // 2. Browser Network Performance Entries (XHR/Fetch/Media chunks)
+JS_STEALTH_PATCH = """() => {
+    try {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {} };
+    } catch (_) {}
+}"""
+
+JS_POLL_SNIFFER = """() => {
+    try {
+        const iframes = [...document.querySelectorAll('iframe')];
+        const uembed = iframes.find(f => f.src && f.src.includes('uembed.php'));
+        
+        let iframeDoc = null;
+        if (uembed && uembed.contentDocument) {
+            iframeDoc = uembed.contentDocument;
+        }
+
+        const streams = [];
+
+        // If uembed iframe is found, trigger play and inspect its performance resources
+        if (iframeDoc) {
+            const v = iframeDoc.querySelector('video');
+            const playBtn = iframeDoc.querySelector('[aria-label=playstop], .unmute, button, video');
+            if (playBtn) {
+                try { playBtn.click(); } catch(_) {}
+            }
+
+            // Extract performance resources (Bhalocast M3U8)
+            if (iframeDoc.defaultView && iframeDoc.defaultView.performance && iframeDoc.defaultView.performance.getEntriesByType) {
+                iframeDoc.defaultView.performance.getEntriesByType('resource').forEach(item => {
+                    if (item.name && (/\\.(m3u8|mpd|ts|m4s)(\\?|$)/i.test(item.name) || /bhalocast|hls|live/i.test(item.name))) {
+                        streams.push(item.name);
+                    }
+                });
+            }
+
+            if (v && v.src && !v.src.startsWith('blob:')) streams.push(v.src);
+            if (v && v.currentSrc && !v.currentSrc.startsWith('blob:')) streams.push(v.currentSrc);
+        }
+
+        // Top-level performance resources
         if (window.performance && performance.getEntriesByType) {
             performance.getEntriesByType('resource').forEach(item => {
-                if (item.name && (/\\.(m3u8|mpd|ts)(\\?|$)/i.test(item.name) || /bhalocast|hls|stream|live/i.test(item.name))) {
-                    list.push(item.name);
+                if (item.name && (/\\.(m3u8|mpd|ts|m4s)(\\?|$)/i.test(item.name) || /bhalocast|hls|live/i.test(item.name))) {
+                    streams.push(item.name);
                 }
             });
         }
 
-        // 3. Scan DOM text for manifest URLs
-        const html = document.documentElement.innerHTML;
-        const matches = html.match(/https?:\\\/\\\/[^"'\\s<>]+\\.(m3u8|mpd)[^"'\\s<>]*/gi) || [];
-        matches.forEach(m => list.push(m.replace(/\\\\\\//g, '/')));
-    } catch (_) {}
-    return Array.from(new Set(list));
+        const discoveredIframes = iframes.map(f => f.src).filter(Boolean);
+
+        return {
+            has_uembed: !!iframeDoc,
+            streams: Array.from(new Set(streams)),
+            iframes: discoveredIframes
+        };
+    } catch (e) {
+        return { error: String(e), streams: [], iframes: [] };
+    }
 }"""
 
-# Known ad / redirect patterns that hijack streaming pages
-AD_PATTERNS = [
-    "breachbillboard",
-    "predestination",
-    "onclick",
-    "highperformancegate",
-    "adkeeper",
-    "histats",
-    "popunder",
-    "doubleclick",
-    "syndication"
-]
+
+def get_local_chromium_path() -> Optional[str]:
+    """Auto-detects local Chromium binary in Replit."""
+    custom = os.getenv("BROWSER_USE_EXECUTABLE_PATH")
+    if custom and os.path.exists(custom):
+        return custom
+
+    for cmd in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]:
+        p = shutil.which(cmd)
+        if p:
+            return p
+
+    pw_cache = os.path.expanduser("~/.cache/ms-playwright")
+    matches = glob.glob(f"{pw_cache}/chromium-*/chrome-linux/chrome")
+    if matches:
+        return matches[-1]
+
+    for p in ["/repl/tools/bin/chromium", "/usr/bin/chromium", "/usr/bin/chromium-browser"]:
+        if os.path.exists(p):
+            return p
+
+    return None
 
 
-@controller.action("Extract live M3U8, MPD streaming manifests from all open browser tabs and DOM")
-async def extract_network_streams(browser: BrowserSession) -> str:
-    """Checks all open browser tabs and network logs for stream URLs."""
-    found = []
+def create_local_profile() -> BrowserProfile:
+    """Builds a local stealth profile."""
+    chrome_path = get_local_chromium_path()
+    profile_kwargs: Dict[str, Any] = {
+        "use_cloud": False,
+        "headless": True,
+        "args": STEALTH_ARGS,
+        "ignore_https_errors": True
+    }
+    if chrome_path:
+        logger.info("Using local Chromium: %s", chrome_path)
+        profile_kwargs["executable_path"] = chrome_path
+
+    return BrowserProfile(**profile_kwargs)
+
+
+@controller.action("Extract live M3U8 streaming manifest URLs from open page, player, and browser network entries")
+async def extract_network_streams(browser_session: BrowserSession) -> ActionResult:
     try:
-        pages = await browser.get_pages()
-        for p in pages:
-            try:
-                res = await p.evaluate(JS_EXTRACTOR)
-                if isinstance(res, list):
-                    found.extend(res)
-                elif isinstance(res, str) and res.startswith("["):
-                    import json
-                    found.extend(json.loads(res))
-            except Exception:
-                pass
-        return f"Streaming URLs found: {list(set(found))}"
+        page = await browser_session.get_current_page()
+        if page:
+            data = await page.evaluate(JS_POLL_SNIFFER)
+            if isinstance(data, dict):
+                streams = data.get("streams", [])
+                m3u8s = [s for s in streams if ".m3u8" in s.lower()]
+                if m3u8s:
+                    return ActionResult(extracted_content=f"Found M3U8 manifest: {m3u8s[0]}")
+                elif streams:
+                    return ActionResult(extracted_content=f"Found streams: {streams[:3]}")
+        return ActionResult(extracted_content="Waiting for stream to buffer, please retry in 3 seconds.")
     except Exception as e:
-        return f"Stream inspection note: {str(e)}"
+        return ActionResult(error=f"Error inspecting streams: {str(e)}")
 
 
 class TaskRequest(BaseModel):
     task: str = Field(..., min_length=1, max_length=4000)
-    max_steps: Optional[int] = Field(default=25, ge=1, le=100, description="Max agent reasoning steps")
-    use_vision: Optional[bool] = Field(default=True, description="Enable visual analysis")
+    max_steps: Optional[int] = Field(default=25, ge=1, le=100)
+    use_vision: Optional[bool] = Field(default=True)
 
 
 class SniffRequest(BaseModel):
     url: str = Field(..., min_length=5, description="Target webpage or stream player URL")
-    timeout: Optional[int] = Field(default=20, ge=5, le=60, description="Seconds to wait for stream requests")
-    referer: Optional[str] = Field(default="", description="Optional custom referer header")
+    timeout: Optional[int] = Field(default=35, ge=10, le=90)
 
 
 @app.get("/")
 def home():
+    local_chrome = get_local_chromium_path()
     return {
         "status": "running",
         "service": "Browser Use Universal API",
-        "version": "3.3.0",
+        "version": "4.1.0",
+        "mode": "100% Free Local Chromium (No Cloud Credits)",
+        "detected_chromium": local_chrome,
+        "stealth": "Enabled (AutomationControlled bypass + Real User-Agent)",
         "endpoints": {
             "agent_runner": "POST /run",
             "direct_stream_sniffer": "POST /sniff"
-        },
-        "features": ["network_log_interception", "ad_redirect_blocking", "auto_iframe_hop", "omniroute_llm"]
+        }
     }
 
 
@@ -114,7 +194,7 @@ def health():
 
 
 # ==============================================================================
-# 🎯 DEDICATED STREAM SNIFFER (/sniff) - Direct Network Log Interception
+# 🎯 DEDICATED STREAM SNIFFER (/sniff)
 # ==============================================================================
 @app.post("/sniff")
 async def sniff_stream(
@@ -126,121 +206,89 @@ async def sniff_stream(
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid API key")
 
     target_url = body.url.strip()
-
-    anti_ad_args = [
-        "--block-new-web-contents",
-        "--disable-popup-blocking=false",
-        "--blink-settings=blockedPopup=true",
-        "--disable-notifications",
-        "--disable-extensions",
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage"
-    ]
-
-    profile = BrowserProfile(
-        use_cloud=(os.getenv("USE_CLOUD_BROWSER", "true").lower() == "true"),
-        args=anti_ad_args,
-        ignore_https_errors=True
-    )
-
+    profile = create_local_profile()
     browser = BrowserSession(browser_profile=profile)
     captured_streams: List[str] = []
     page_title = ""
 
     try:
-        # 1. Start browser session properly
-        logger.info("Sniffer starting browser session...")
+        # 1. Start browser
+        logger.info("Starting local stealth browser...")
         await browser.start()
 
-        # 2. Attach real-time network request listener & ad-blocker
-        cur_page = await browser.get_current_page()
-        if cur_page:
-            ctx = cur_page.context
-
-            def on_network_req(req):
-                u = req.url
-                if any(ext in u.lower() for ext in [".m3u8", ".mpd", ".ts", ".m4s", "bhalocast", "star1kibich"]):
-                    if u not in captured_streams:
-                        logger.info("Network log stream detected: %s", u)
-                        captured_streams.append(u)
-
-            ctx.on("request", on_network_req)
-
-            async def route_ad_blocker(route):
-                u = route.request.url.lower()
-                if any(ad in u for ad in AD_PATTERNS):
-                    logger.info("Blocked ad request: %s", u[:80])
-                    await route.abort()
-                else:
-                    await route.continue_()
-
-            try:
-                await ctx.route("**/*", route_ad_blocker)
-            except Exception:
-                pass
-
-        # 3. Navigate to target webpage
-        logger.info("Sniffer navigating to: %s", target_url)
+        # 2. Navigate
+        logger.info("Navigating to: %s", target_url)
         await browser.navigate_to(target_url)
-        await asyncio.sleep(5)
 
-        try:
-            page_title = await browser.get_current_page_title()
-        except Exception:
-            pass
-
-        # 4. Click on video or container to trigger playback
-        try:
-            p = await browser.get_current_page()
-            if p:
-                await p.evaluate("""() => {
-                    const targets = document.querySelectorAll('video, .player, #player, iframe, button, div[class*="play"]');
-                    targets.forEach(el => { try { el.click(); } catch(_) {} });
-                }""")
-                await asyncio.sleep(4)
-        except Exception:
-            pass
-
-        # 5. Scan DOM & Performance entries
-        pages = await browser.get_pages()
-        found_iframes = []
-        for p in pages:
+        # Apply stealth patch
+        p = await browser.get_current_page()
+        if p:
             try:
-                raw_res = await p.evaluate(JS_EXTRACTOR)
-                urls = raw_res if isinstance(raw_res, list) else []
-                for u in urls:
-                    if re.search(r"\.(m3u8|mpd)(\?|$)", u, re.I):
-                        if u not in captured_streams:
-                            captured_streams.append(u)
-                    elif re.search(r"(\.ts|\.m4s|bhalocast)(\?|$)", u, re.I):
-                        if u not in captured_streams:
-                            captured_streams.append(u)
-                    elif "player.php" in u or "embed" in u:
-                        found_iframes.append(u)
+                await p.evaluate(JS_STEALTH_PATCH)
             except Exception:
                 pass
 
-        # 6. If no stream captured yet, hop to iframe
-        if not any(".m3u8" in s for s in captured_streams) and found_iframes:
-            iframe_target = found_iframes[0]
-            logger.info("Jumping to embedded player iframe: %s", iframe_target)
-            await browser.navigate_to(iframe_target)
-            await asyncio.sleep(5)
-
+        # 3. Handle Cloudflare "Just a moment..." challenge if present
+        for cf_wait in range(6):
+            await asyncio.sleep(2)
             try:
-                ip = await browser.get_current_page()
-                if ip:
-                    await ip.evaluate("""() => {
-                        const v = document.querySelector('video') || document.querySelector('.player') || document.body;
-                        if (v) v.click();
-                    }""")
-                    await asyncio.sleep(4)
+                title = await browser.get_current_page_title()
+                if "just a moment" in title.lower():
+                    logger.info("Waiting for Cloudflare verification... (%d/6)", cf_wait + 1)
+                else:
+                    page_title = title
+                    break
             except Exception:
                 pass
+
+        # 4. If target is webcric.im, hop into the embedded player iframe (playsza.st)
+        p = await browser.get_current_page()
+        if p and "webcric" in target_url:
+            data = await p.evaluate(JS_POLL_SNIFFER)
+            if isinstance(data, dict):
+                discovered_iframes = data.get("iframes", [])
+                player_iframe = next((f for f in discovered_iframes if "playsza.st" in f or "player.php" in f), None)
+                if player_iframe:
+                    logger.info("Found playsza player iframe inside webcric: %s", player_iframe)
+                    await browser.navigate_to(player_iframe)
+                    await asyncio.sleep(3)
+                    p = await browser.get_current_page()
+                    if p:
+                        try:
+                            await p.evaluate(JS_STEALTH_PATCH)
+                        except Exception:
+                            pass
+
+        # 5. Polling loop: Wait for plays.js countdown and uembed.php stream resources
+        logger.info("Starting active polling for stream resources...")
+        max_attempts = int(body.timeout // 2)
+        for attempt in range(max_attempts):
+            await asyncio.sleep(2)
+            try:
+                cur_p = await browser.get_current_page()
+                if not cur_p:
+                    continue
+
+                eval_res = await cur_p.evaluate(JS_POLL_SNIFFER)
+                if isinstance(eval_res, dict):
+                    streams = eval_res.get("streams", [])
+                    for s in streams:
+                        if s not in captured_streams:
+                            captured_streams.append(s)
+
+                    m3u8s = [s for s in captured_streams if ".m3u8" in s.lower()]
+                    if m3u8s:
+                        logger.info("Stream manifest captured at attempt %d: %s", attempt, m3u8s[0])
+                        break
+            except Exception as e:
+                logger.debug("Poll attempt %d note: %s", attempt, e)
 
     except Exception as exc:
         logger.exception("Sniffer execution error: %s", exc)
+        return {
+            "status": "error",
+            "error_detail": str(exc)
+        }
     finally:
         try:
             await browser.close()
@@ -264,7 +312,7 @@ async def sniff_stream(
 
 
 # ==============================================================================
-# 🤖 BROWSER USE AGENT RUNNER (/run) - Interactive LLM Tasks
+# 🤖 BROWSER USE AGENT RUNNER (/run)
 # ==============================================================================
 @app.post("/run")
 async def run_task(
@@ -282,21 +330,7 @@ async def run_task(
             detail="OPENAI_API_KEY environment variable is missing"
         )
 
-    anti_ad_args = [
-        "--disable-popup-blocking=false",
-        "--blink-settings=blockedPopup=true",
-        "--disable-notifications",
-        "--disable-extensions",
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage"
-    ]
-
-    profile = BrowserProfile(
-        use_cloud=(os.getenv("USE_CLOUD_BROWSER", "true").lower() == "true"),
-        args=anti_ad_args,
-        ignore_https_errors=True
-    )
+    profile = create_local_profile()
 
     llm = ChatOpenAI(
         model=os.getenv("OMNIROUTE_MODEL", "agy/claude-opus-4-6"),
@@ -307,51 +341,11 @@ async def run_task(
     captured_streams: List[str] = []
     stream_regex = re.compile(r"https?://[^\s\"']+\.(m3u8|mpd)(\?[^\s\"']*)?", re.IGNORECASE)
 
-    task_text = body.task
-    if any(k in task_text.lower() for k in ["m3u8", "manifest", "stream", "hls"]):
-        task_text += (
-            "\n\n[SYSTEM DIRECTIVE]:"
-            "\n1. Click the play button or video player container to start streaming."
-            "\n2. Wait 8-10 seconds for video playback."
-            "\n3. Check network resources or invoke extract_network_streams."
-        )
-
     try:
         browser = BrowserSession(browser_profile=profile)
-        await browser.start()
-
-        # Attach real-time Network Request Interception & Ad-blocker to BrowserContext
-        try:
-            page = await browser.get_current_page()
-            if page:
-                ctx = page.context
-
-                def on_network_log(req):
-                    url = req.url
-                    if any(ext in url.lower() for ext in [".m3u8", ".mpd", ".ts", ".m4s", "bhalocast", "star1kibich"]):
-                        if url not in captured_streams:
-                            logger.info("Real-time agent network log captured: %s", url)
-                            captured_streams.append(url)
-
-                ctx.on("request", on_network_log)
-
-                async def block_ads_agent(route):
-                    req_url = route.request.url.lower()
-                    if any(ad in req_url for ad in AD_PATTERNS):
-                        logger.info("Agent blocked ad: %s", req_url[:80])
-                        await route.abort()
-                    else:
-                        await route.continue_()
-
-                try:
-                    await ctx.route("**/*", block_ads_agent)
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning("Could not attach network listener to agent: %s", e)
 
         agent = Agent(
-            task=task_text,
+            task=body.task,
             llm=llm,
             browser=browser,
             controller=controller,
@@ -364,19 +358,16 @@ async def run_task(
         is_done = history.is_done()
         result_text = history.final_result() or "Task completed"
 
-        # Scan all open pages before closing
+        # Final sniffer pass before closing
         try:
-            pages = await browser.get_pages()
-            for p in pages:
-                try:
-                    extracted_raw = await p.evaluate(JS_EXTRACTOR)
-                    for item in re.findall(r"https?://[^\s\"'\[\],]+\.(m3u8|mpd)(\?[^\s\"'\[\],]*)?", str(extracted_raw), re.I):
-                        full_url = item[0] if isinstance(item, tuple) else item
-                        captured_streams.append(full_url)
-                except Exception:
-                    pass
+            p = await browser.get_current_page()
+            if p:
+                eval_res = await p.evaluate(JS_POLL_SNIFFER)
+                if isinstance(eval_res, dict):
+                    for s in eval_res.get("streams", []):
+                        captured_streams.append(s)
         except Exception as e:
-            logger.warning("Post-run browser network scan note: %s", e)
+            logger.warning("Post-run browser sniffer note: %s", e)
 
         for match in stream_regex.finditer(str(result_text)):
             captured_streams.append(match.group(0))
@@ -384,7 +375,6 @@ async def run_task(
         clean_streams = sorted(list(dict.fromkeys(captured_streams)))
         m3u8_found = [u for u in clean_streams if ".m3u8" in u.lower()]
 
-        # Enrich result with captured network streams
         if m3u8_found and not any(m in result_text for m in m3u8_found):
             result_text += f"\n\n[Network Diagnostics]: Found {len(m3u8_found)} M3U8 stream manifest(s) in browser network logs:\n" + "\n".join(m3u8_found)
 
