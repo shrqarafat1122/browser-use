@@ -16,8 +16,8 @@ logger = logging.getLogger("browser_use_api")
 
 app = FastAPI(
     title="Browser Use Universal API & Stream Sniffer",
-    description="Automated AI browser agent with dedicated cross-frame M3U8 stream sniffer",
-    version="3.2.0"
+    description="Automated AI browser agent with real-time network log stream sniffer",
+    version="3.3.0"
 )
 
 controller = Controller()
@@ -46,6 +46,19 @@ JS_EXTRACTOR = """() => {
     } catch (_) {}
     return Array.from(new Set(list));
 }"""
+
+# Known ad / redirect patterns that hijack streaming pages
+AD_PATTERNS = [
+    "breachbillboard",
+    "predestination",
+    "onclick",
+    "highperformancegate",
+    "adkeeper",
+    "histats",
+    "popunder",
+    "doubleclick",
+    "syndication"
+]
 
 
 @controller.action("Extract live M3U8, MPD streaming manifests from all open browser tabs and DOM")
@@ -76,7 +89,7 @@ class TaskRequest(BaseModel):
 
 
 class SniffRequest(BaseModel):
-    url: str = Field(..., description="Target webpage URL hosting the embedded player")
+    url: str = Field(..., min_length=5, description="Target webpage or stream player URL")
     timeout: Optional[int] = Field(default=20, ge=5, le=60, description="Seconds to wait for stream requests")
     referer: Optional[str] = Field(default="", description="Optional custom referer header")
 
@@ -86,12 +99,12 @@ def home():
     return {
         "status": "running",
         "service": "Browser Use Universal API",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "endpoints": {
             "agent_runner": "POST /run",
             "direct_stream_sniffer": "POST /sniff"
         },
-        "features": ["browser_session_started", "auto_iframe_hop", "cross_frame_m3u8", "omniroute_llm"]
+        "features": ["network_log_interception", "ad_redirect_blocking", "auto_iframe_hop", "omniroute_llm"]
     }
 
 
@@ -101,7 +114,7 @@ def health():
 
 
 # ==============================================================================
-# 🎯 DEDICATED STREAM SNIFFER (/sniff) - Direct Cloud Browser & Auto Iframe Hop
+# 🎯 DEDICATED STREAM SNIFFER (/sniff) - Direct Network Log Interception
 # ==============================================================================
 @app.post("/sniff")
 async def sniff_stream(
@@ -140,7 +153,34 @@ async def sniff_stream(
         logger.info("Sniffer starting browser session...")
         await browser.start()
 
-        # 2. Navigate to target webpage
+        # 2. Attach real-time network request listener & ad-blocker
+        cur_page = await browser.get_current_page()
+        if cur_page:
+            ctx = cur_page.context
+
+            def on_network_req(req):
+                u = req.url
+                if any(ext in u.lower() for ext in [".m3u8", ".mpd", ".ts", ".m4s", "bhalocast", "star1kibich"]):
+                    if u not in captured_streams:
+                        logger.info("Network log stream detected: %s", u)
+                        captured_streams.append(u)
+
+            ctx.on("request", on_network_req)
+
+            async def route_ad_blocker(route):
+                u = route.request.url.lower()
+                if any(ad in u for ad in AD_PATTERNS):
+                    logger.info("Blocked ad request: %s", u[:80])
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            try:
+                await ctx.route("**/*", route_ad_blocker)
+            except Exception:
+                pass
+
+        # 3. Navigate to target webpage
         logger.info("Sniffer navigating to: %s", target_url)
         await browser.navigate_to(target_url)
         await asyncio.sleep(5)
@@ -150,11 +190,11 @@ async def sniff_stream(
         except Exception:
             pass
 
-        # 3. Click on video or container to trigger playback
+        # 4. Click on video or container to trigger playback
         try:
-            cur_page = await browser.get_current_page()
-            if cur_page:
-                await cur_page.evaluate("""() => {
+            p = await browser.get_current_page()
+            if p:
+                await p.evaluate("""() => {
                     const targets = document.querySelectorAll('video, .player, #player, iframe, button, div[class*="play"]');
                     targets.forEach(el => { try { el.click(); } catch(_) {} });
                 }""")
@@ -162,7 +202,7 @@ async def sniff_stream(
         except Exception:
             pass
 
-        # 4. Scan parent page and detect iframes
+        # 5. Scan DOM & Performance entries
         pages = await browser.get_pages()
         found_iframes = []
         for p in pages:
@@ -171,46 +211,33 @@ async def sniff_stream(
                 urls = raw_res if isinstance(raw_res, list) else []
                 for u in urls:
                     if re.search(r"\.(m3u8|mpd)(\?|$)", u, re.I):
-                        captured_streams.append(u)
+                        if u not in captured_streams:
+                            captured_streams.append(u)
                     elif re.search(r"(\.ts|\.m4s|bhalocast)(\?|$)", u, re.I):
-                        captured_streams.append(u)
+                        if u not in captured_streams:
+                            captured_streams.append(u)
                     elif "player.php" in u or "embed" in u:
                         found_iframes.append(u)
             except Exception:
                 pass
 
-        # 5. If no M3U8 found on parent, jump into the embedded iframe!
-        if not captured_streams and found_iframes:
+        # 6. If no stream captured yet, hop to iframe
+        if not any(".m3u8" in s for s in captured_streams) and found_iframes:
             iframe_target = found_iframes[0]
-            logger.info("Parent scanned, jumping to embedded player iframe: %s", iframe_target)
+            logger.info("Jumping to embedded player iframe: %s", iframe_target)
             await browser.navigate_to(iframe_target)
             await asyncio.sleep(5)
 
-            # Click play inside iframe
             try:
-                iframe_page = await browser.get_current_page()
-                if iframe_page:
-                    await iframe_page.evaluate("""() => {
+                ip = await browser.get_current_page()
+                if ip:
+                    await ip.evaluate("""() => {
                         const v = document.querySelector('video') || document.querySelector('.player') || document.body;
                         if (v) v.click();
                     }""")
                     await asyncio.sleep(4)
             except Exception:
                 pass
-
-            # Re-scan inside iframe
-            pages = await browser.get_pages()
-            for p in pages:
-                try:
-                    raw_res = await p.evaluate(JS_EXTRACTOR)
-                    urls = raw_res if isinstance(raw_res, list) else []
-                    for u in urls:
-                        if re.search(r"\.(m3u8|mpd)(\?|$)", u, re.I):
-                            captured_streams.append(u)
-                        elif re.search(r"(\.ts|\.m4s|bhalocast)(\?|$)", u, re.I):
-                            captured_streams.append(u)
-                except Exception:
-                    pass
 
     except Exception as exc:
         logger.exception("Sniffer execution error: %s", exc)
@@ -225,7 +252,7 @@ async def sniff_stream(
     ts_list = [u for u in clean_streams if ".ts" in u.lower()]
 
     return {
-        "status": "success" if clean_streams else "partial",
+        "status": "success" if m3u8_list else ("partial" if clean_streams else "not_found"),
         "target_url": target_url,
         "page_title": page_title,
         "manifest_found": len(m3u8_list) > 0,
@@ -286,11 +313,42 @@ async def run_task(
             "\n\n[SYSTEM DIRECTIVE]:"
             "\n1. Click the play button or video player container to start streaming."
             "\n2. Wait 8-10 seconds for video playback."
-            "\n3. Use 'extract_network_streams' to scan all tabs and network resources."
+            "\n3. Check network resources or invoke extract_network_streams."
         )
 
     try:
         browser = BrowserSession(browser_profile=profile)
+        await browser.start()
+
+        # Attach real-time Network Request Interception & Ad-blocker to BrowserContext
+        try:
+            page = await browser.get_current_page()
+            if page:
+                ctx = page.context
+
+                def on_network_log(req):
+                    url = req.url
+                    if any(ext in url.lower() for ext in [".m3u8", ".mpd", ".ts", ".m4s", "bhalocast", "star1kibich"]):
+                        if url not in captured_streams:
+                            logger.info("Real-time agent network log captured: %s", url)
+                            captured_streams.append(url)
+
+                ctx.on("request", on_network_log)
+
+                async def block_ads_agent(route):
+                    req_url = route.request.url.lower()
+                    if any(ad in req_url for ad in AD_PATTERNS):
+                        logger.info("Agent blocked ad: %s", req_url[:80])
+                        await route.abort()
+                    else:
+                        await route.continue_()
+
+                try:
+                    await ctx.route("**/*", block_ads_agent)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("Could not attach network listener to agent: %s", e)
 
         agent = Agent(
             task=task_text,
@@ -323,13 +381,18 @@ async def run_task(
         for match in stream_regex.finditer(str(result_text)):
             captured_streams.append(match.group(0))
 
+        clean_streams = sorted(list(dict.fromkeys(captured_streams)))
+        m3u8_found = [u for u in clean_streams if ".m3u8" in u.lower()]
+
+        # Enrich result with captured network streams
+        if m3u8_found and not any(m in result_text for m in m3u8_found):
+            result_text += f"\n\n[Network Diagnostics]: Found {len(m3u8_found)} M3U8 stream manifest(s) in browser network logs:\n" + "\n".join(m3u8_found)
+
         actions = []
         try:
             actions = history.action_names()
         except Exception:
             pass
-
-        clean_streams = sorted(list(set(captured_streams)))
 
         return {
             "status": "success",
